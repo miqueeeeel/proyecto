@@ -120,3 +120,29 @@ Algunas ideas de evolución son:
 
 ---
 
+
+
+### Como quiero que se vea
+```
+proyecto/
+├── backend/
+│   ├── app.py (FastAPI)
+│   ├── chess_analyzer.py
+│   └── requirements.txt
+├── frontend/ (opcional)
+├── Dockerfile
+├── tests/
+├── README.md
+└── .env.example
+```
+---
+## ❌ Lo que falta:
+
+Solo consola, sin interfaz visual
+No hay API REST para integrar en otros sistemas
+No es escalable ni tiene arquitectura profesional
+Falta documentación técnica (cómo instalar, usar, deploy)
+No hay tests unitarios
+Sin estructura de proyecto clara (solo un archivo .py)
+✅
+---

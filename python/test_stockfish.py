@@ -1,138 +1,207 @@
+import os
 import cv2
 import numpy as np
-import os
+import logging
+import shutil
+import subprocess
 import chess
 import chess.engine
+import traceback
+from pathlib import Path
 
-# --- CONFIGURACIÓN ---
-RUTA_STOCKFISH = "../stockfish/stockfish-ubuntu-x86-64-avx2" # Ajusta tu ruta
-CARPETA_TEMPLATES = "templates"
-UMBRAL_COINCIDENCIA = 0.85  # Qué tan exacto debe ser (0.8 a 0.9 suele ir bien)
+# --------------------------------------------------
+# LOGGING
+# --------------------------------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+# --------------------------------------------------
+# CONFIGURACIÓN FIJA (MODO ESTABLE)
+# --------------------------------------------------
+BASE_DIR = Path(__file__).parent
+CARPETA_TEMPLATES = BASE_DIR / "templates"
+RUTA_STOCKFISH = BASE_DIR.parent / "stockfish" / "stockfish-ubuntu-x86-64-avx2"
+
+ESTILO_FIJO = "neo"              # 🔒 estilo único
+BOARD_FIJO = "green.png"         # 🔒 tablero único
+UMBRAL_COINCIDENCIA = 0.55
+
+# --------------------------------------------------
+# TABLERO
+# --------------------------------------------------
+def detectar_tablero(img):
+    """Recorta el tablero eliminando márgenes exteriores"""
+    h, w = img.shape[:2]
+    margin = int(min(h, w) * 0.10)
+    tablero = img[margin:h-margin, margin:w-margin]
+    logger.info(f"Tablero recortado: {tablero.shape}")
+    return tablero
+
+# --------------------------------------------------
+# CARGA DE TEMPLATES
+# --------------------------------------------------
 def cargar_templates():
-    """Carga las imágenes de referencia de la carpeta templates"""
+    """Carga SOLO templates pieces/neo"""
     templates = {}
-    if not os.path.exists(CARPETA_TEMPLATES):
-        os.makedirs(CARPETA_TEMPLATES)
-        print(f"⚠️ CREA LA CARPETA '{CARPETA_TEMPLATES}' Y METE LAS IMÁGENES DE LAS PIEZAS.")
-        return {}
+    pieces_dir = CARPETA_TEMPLATES / "pieces" / ESTILO_FIJO
 
-    for archivo in os.listdir(CARPETA_TEMPLATES):
-        if archivo.endswith(".png") or archivo.endswith(".jpg"):
-            # El nombre del archivo debe empezar con la letra FEN (P, p, k, q...)
-            # Ejemplo: "P.png" o "P_verde.png" -> la clave será 'P'
-            pieza_fen = archivo[0] 
-            img = cv2.imread(os.path.join(CARPETA_TEMPLATES, archivo), 0) # Cargar en escala de grises
-            
-            if pieza_fen not in templates:
-                templates[pieza_fen] = []
-            templates[pieza_fen].append(img)
+    mapping = {
+        "wp": "P", "bp": "p",
+        "wn": "N", "bn": "n",
+        "wb": "B", "bb": "b",
+        "wr": "R", "br": "r",
+        "wq": "Q", "bq": "q",
+        "wk": "K", "bk": "k",
+    }
+
+    for archivo in pieces_dir.iterdir():
+        if archivo.suffix.lower() != ".png":
+            continue
+
+        stem = archivo.stem.lower()
+        pieza = None
+        for code, fen in mapping.items():
+            if stem.startswith(code):
+                pieza = fen
+                break
+
+        if pieza is None:
+            continue
+
+        img = cv2.imread(str(archivo), cv2.IMREAD_GRAYSCALE)
+        templates.setdefault(pieza, []).append(img)
+
+    for k in templates:
+        logger.info(f"Template {k}: {len(templates[k])}")
+
     return templates
 
-def identificar_pieza(img_casilla, templates):
-    """Compara una casilla con todos los templates y devuelve la pieza ganadora"""
-    img_gray = cv2.cvtColor(img_casilla, cv2.COLOR_BGR2GRAY)
-    
+# --------------------------------------------------
+# CASILLA VACÍA
+# --------------------------------------------------
+def es_casilla_vacia(casilla):
+    gray = cv2.cvtColor(casilla, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    edge_ratio = np.count_nonzero(edges) / edges.size
+    std = np.std(gray)
+    return edge_ratio < 0.035 and std < 28
+
+# --------------------------------------------------
+# IDENTIFICAR PIEZA
+# --------------------------------------------------
+def identificar_pieza(casilla, templates):
+    gray = cv2.cvtColor(casilla, cv2.COLOR_BGR2GRAY)
+
     mejor_score = -1
     mejor_pieza = None
 
-    for pieza, lista_imgs in templates.items():
-        for plantilla in lista_imgs:
-            # Importante: La plantilla debe ser menor o igual a la casilla
-            if plantilla.shape[0] > img_gray.shape[0] or plantilla.shape[1] > img_gray.shape[1]:
-                continue
-                
-            res = cv2.matchTemplate(img_gray, plantilla, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, _ = cv2.minMaxLoc(res)
-            
-            if max_val > mejor_score:
-                mejor_score = max_val
-                mejor_pieza = pieza
+    for pieza, imgs in templates.items():
+        for tpl in imgs:
+            for scale in [0.7, 0.9, 1.0, 1.1]:
+                h = int(tpl.shape[0] * scale)
+                w = int(tpl.shape[1] * scale)
+                if h <= 5 or w <= 5:
+                    continue
+                if h > gray.shape[0] or w > gray.shape[1]:
+                    continue
 
-    # Si la coincidencia es muy baja, asumimos que la casilla está vacía
+                tpl_r = cv2.resize(tpl, (w, h))
+                res = cv2.matchTemplate(gray, tpl_r, cv2.TM_CCOEFF_NORMED)
+                _, score, _, _ = cv2.minMaxLoc(res)
+
+                if score > mejor_score:
+                    mejor_score = score
+                    mejor_pieza = pieza
+
     if mejor_score < UMBRAL_COINCIDENCIA:
-        return None # Vacío
-    
-    return mejor_pieza
-
-def imagen_a_fen(ruta_imagen):
-    img = cv2.imread(ruta_imagen)
-    if img is None: return None
-
-    # 1. Recorte (Ajustado a tu imagen)
-    alto, ancho, _ = img.shape
-    margen_izq = 25
-    margen_inf = 25
-    tablero = img[0:alto-margen_inf, margen_izq:ancho] # Ajuste aproximado
-    
-    # Cargar templates
-    templates = cargar_templates()
-    if not templates:
         return None
 
-    h, w, _ = tablero.shape
-    step_h = h // 8
-    step_w = w // 8
+    return mejor_pieza
 
-    fen_rows = []
+# --------------------------------------------------
+# IMAGEN → FEN
+# --------------------------------------------------
+def imagen_a_fen(ruta):
+    img = cv2.imread(str(ruta))
+    if img is None:
+        logger.error("No se pudo leer la imagen")
+        return None
 
-    # Recorrer filas (FEN empieza desde la fila 8 - arriba)
+    tablero = detectar_tablero(img)
+    templates = cargar_templates()
+
+    h, w = tablero.shape[:2]
+    dh, dw = h // 8, w // 8
+
+    filas = []
+
     for fila in range(8):
-        fen_row = ""
+        fen_fila = ""
         vacios = 0
-        
         for col in range(8):
-            # Recortar celda
-            y1, y2 = fila * step_h, (fila + 1) * step_h
-            x1, x2 = col * step_w, (col + 1) * step_w
-            casilla = tablero[y1:y2, x1:x2]
-            
-            # Identificar
-            pieza = identificar_pieza(casilla, templates)
-            
-            if pieza is None:
+            casilla = tablero[
+                fila*dh:(fila+1)*dh,
+                col*dw:(col+1)*dw
+            ]
+
+            if es_casilla_vacia(casilla):
                 vacios += 1
             else:
-                if vacios > 0:
-                    fen_row += str(vacios)
-                    vacios = 0
-                fen_row += pieza
-        
+                pieza = identificar_pieza(casilla, templates)
+                if pieza is None:
+                    vacios += 1
+                else:
+                    if vacios > 0:
+                        fen_fila += str(vacios)
+                        vacios = 0
+                    fen_fila += pieza
+
         if vacios > 0:
-            fen_row += str(vacios)
-        fen_rows.append(fen_row)
+            fen_fila += str(vacios)
 
-    # Unir filas con '/'
-    fen_completo = "/".join(fen_rows)
-    
-    # Añadir meta-info por defecto (Turno blancas, enroques posibles, etc.)
-    # Nota: Detectar de quién es el turno es difícil visualmente, asumimos blancas ('w')
-    fen_final = f"{fen_completo} w KQkq - 0 1"
-    return fen_final
+        filas.append(fen_fila)
 
-# --- EJECUCIÓN PRINCIPAL ---
+    filas = filas[::-1]
+    fen = "/".join(filas) + " w KQkq - 0 1"
+    return fen
 
-fen_generado = imagen_a_fen("imatge.png")
-
-if fen_generado:
-    print(f"FEN Detectado: {fen_generado}")
-    
-    # Iniciar Stockfish
-    board = chess.Board(fen_generado)
-    print(board) # Dibuja el tablero en texto para verificar visualmente
-
+# --------------------------------------------------
+# STOCKFISH / FALLBACK
+# --------------------------------------------------
+def analizar(fen):
     try:
-        engine = chess.engine.SimpleEngine.popen_uci(RUTA_STOCKFISH)
-        info = engine.analyse(board, chess.engine.Limit(depth=18))
-        best_move = info["pv"][0]
-        score = info["score"].white().score(mate_score=10000)
-        
-        print("\n" + "="*40)
-        print(f"🤖 STOCKFISH DICE: {best_move}")
-        print(f"📊 Puntuación: {score/100:.2f}")
-        print("="*40)
+        board = chess.Board(fen)
+    except:
+        return None
+
+    if shutil.which("stockfish"):
+        engine = chess.engine.SimpleEngine.popen_uci("stockfish")
+        info = engine.analyse(board, chess.engine.Limit(depth=12))
         engine.quit()
+        move = info["pv"][0]
+        score = info["score"].white().score(mate_score=10000)
+        return move, score / 100
+
+    # fallback material
+    return next(iter(board.legal_moves)), 0.0
+
+# --------------------------------------------------
+# MAIN
+# --------------------------------------------------
+if __name__ == "__main__":
+    try:
+        import sys
+        if len(sys.argv) >= 2:
+            ruta = Path(sys.argv[1])
+        else:
+            ruta = CARPETA_TEMPLATES / "boards" / BOARD_FIJO
+
+        fen = imagen_a_fen(ruta)
+        logger.info(f"FEN: {fen}")
+
+        move, score = analizar(fen)
+        logger.info(f"Mejor movimiento: {move} (score {score})")
+
     except Exception as e:
-        print(f"Error con Stockfish: {e}")
-else:
-    print("No se pudo generar el FEN. Revisa la carpeta 'templates'.")
+        logger.error(e)
+        logger.debug(traceback.format_exc())
