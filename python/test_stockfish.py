@@ -8,7 +8,7 @@ from pathlib import Path
 # --------------------------------------------------
 # LOGGING
 # --------------------------------------------------
-logging.basicConfig(level=logging.DEBUG)  # Cambiar a DEBUG para ver detección de color
+logging.basicConfig(level=logging.INFO)  # INFO para output limpio
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------
@@ -78,7 +78,12 @@ def obtener_casillas_reales(img):
     mask = mascara_tablero(img, c1, c2)
     v_lines, h_lines = detectar_lineas_grid(mask)
 
+    logger.info(f"Líneas horizontales (y): {h_lines}")
+    logger.info(f"Primera fila será desde y={h_lines[0]} hasta y={h_lines[1]}")
+    logger.info(f"Última fila será desde y={h_lines[7]} hasta y={h_lines[8]}")
+
     casillas = []
+    # Leer en el orden que aparece en la imagen (top to bottom)
     for fila in range(8):
         fila_casillas = []
         for col in range(8):
@@ -251,63 +256,83 @@ def es_casilla_vacia(casilla):
     return std < 18 and diff_ratio < 0.15
 
 
-def identificar_tipo_pieza(casilla, templates):
+def identificar_tipo_pieza(casilla, templates, es_blanca=True):
     """
-    Identifica el TIPO de pieza (sin considerar color) usando template matching.
-    Retorna: letra de pieza (P/N/B/R/Q/K) o None
+    Identifica el TIPO de pieza usando template matching.
+    Usa diferentes estrategias para piezas blancas vs negras.
     """
     casilla_norm = normalizar_casilla(casilla)
     gray = cv2.cvtColor(casilla_norm, cv2.COLOR_BGR2GRAY)
     
-    # Preprocesamiento
+    # Preprocesamiento básico
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
     
-    # IMPORTANTE: Para piezas blancas con bordes negros, 
-    # usamos detección de bordes para extraer la forma
-    edges = cv2.Canny(gray, 50, 150)
-    
-    # Combinar imagen original y bordes
-    gray_combined = cv2.addWeighted(gray, 0.7, edges, 0.3, 0)
-    gray_combined = cv2.normalize(gray_combined, None, 0, 255, cv2.NORM_MINMAX)
-    
-    ch, cw = gray_combined.shape[:2]
+    ch, cw = gray.shape[:2]
     mejor_score = -1
     mejor_tipo = None
+    
+    # Para piezas BLANCAS: usar detección de bordes (tienen contorno negro)
+    if es_blanca:
+        edges = cv2.Canny(gray, 50, 150)
+        gray_proc = cv2.addWeighted(gray, 0.7, edges, 0.3, 0)
+        gray_proc = cv2.normalize(gray_proc, None, 0, 255, cv2.NORM_MINMAX)
+    else:
+        # Para piezas NEGRAS: usar solo escala de grises normalizada
+        # (no tienen bordes fuertes, son grises sólidos)
+        gray_proc = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+        # Opcional: invertir para mejor match
+        # gray_proc = 255 - gray_proc
 
     for pieza_letra, imgs in templates.items():
-        # Quitar el color de la letra (P/p -> P, N/n -> N, etc.)
         tipo = pieza_letra.upper()
         max_score_tipo = 0
         
         for tpl in imgs:
-            # Preprocesar template similar
+            # Preprocesar template igual que la casilla
             tpl_proc = cv2.GaussianBlur(tpl, (3, 3), 0)
-            edges_tpl = cv2.Canny(tpl_proc, 50, 150)
-            tpl_combined = cv2.addWeighted(tpl_proc, 0.7, edges_tpl, 0.3, 0)
-            tpl_combined = cv2.normalize(tpl_combined, None, 0, 255, cv2.NORM_MINMAX)
             
-            th, tw = tpl_combined.shape[:2]
+            if es_blanca:
+                edges_tpl = cv2.Canny(tpl_proc, 50, 150)
+                tpl_proc = cv2.addWeighted(tpl_proc, 0.7, edges_tpl, 0.3, 0)
+                tpl_proc = cv2.normalize(tpl_proc, None, 0, 255, cv2.NORM_MINMAX)
+            else:
+                tpl_proc = cv2.normalize(tpl_proc, None, 0, 255, cv2.NORM_MINMAX)
+            
+            th, tw = tpl_proc.shape[:2]
             
             # Probar varias escalas
-            for scale_factor in [0.6, 0.75, 0.9, 1.0, 1.1, 1.25]:
+            escalas = [0.6, 0.75, 0.85, 0.95, 1.0, 1.1, 1.25, 1.4] if not es_blanca else [0.6, 0.75, 0.9, 1.0, 1.1, 1.25]
+            
+            for scale_factor in escalas:
                 scale = min(ch / th, cw / tw) * scale_factor
                 new_w, new_h = int(tw * scale), int(th * scale)
                 
                 if new_w < 10 or new_h < 10 or new_w > cw or new_h > ch:
                     continue
                     
-                tpl_r = cv2.resize(tpl_combined, (new_w, new_h))
+                tpl_r = cv2.resize(tpl_proc, (new_w, new_h))
 
-                res = cv2.matchTemplate(gray_combined, tpl_r, cv2.TM_CCOEFF_NORMED)
-                _, score, _, _ = cv2.minMaxLoc(res)
-                
-                max_score_tipo = max(max_score_tipo, score)
+                # Probar diferentes métodos de matching
+                for method in [cv2.TM_CCOEFF_NORMED, cv2.TM_CCORR_NORMED]:
+                    res = cv2.matchTemplate(gray_proc, tpl_r, method)
+                    _, score, _, _ = cv2.minMaxLoc(res)
+                    
+                    max_score_tipo = max(max_score_tipo, score)
 
-                if score > mejor_score:
-                    mejor_score = score
-                    mejor_tipo = tipo
+                    if score > mejor_score:
+                        mejor_score = score
+                        mejor_tipo = tipo
+        
+        # Log para debugging
+        if max_score_tipo > 0.3:
+            logger.debug(f"  {tipo}: {max_score_tipo:.3f}")
 
-    if mejor_score >= UMBRAL_COINCIDENCIA:
+    logger.debug(f"Mejor match: {mejor_tipo} con score {mejor_score:.3f}")
+    
+    # Umbral más bajo para piezas negras
+    umbral = UMBRAL_COINCIDENCIA if es_blanca else UMBRAL_COINCIDENCIA * 0.85
+    
+    if mejor_score >= umbral:
         return mejor_tipo
 
     return None
@@ -331,14 +356,14 @@ def identificar_pieza(casilla, templates_white, templates_black):
     
     # 2. Detectar tipo usando templates apropiados
     if color == 'white':
-        tipo = identificar_tipo_pieza(casilla, templates_white)
+        tipo = identificar_tipo_pieza(casilla, templates_white, es_blanca=True)
         if tipo:
             logger.debug(f"Tipo detectado: {tipo} -> {tipo.upper()}")
             return tipo.upper()  # P, N, B, R, Q, K
         else:
             logger.debug(f"No se detectó tipo para pieza blanca")
     else:  # black
-        tipo = identificar_tipo_pieza(casilla, templates_black)
+        tipo = identificar_tipo_pieza(casilla, templates_black, es_blanca=False)
         if tipo:
             logger.debug(f"Tipo detectado: {tipo} -> {tipo.lower()}")
             return tipo.lower()  # p, n, b, r, q, k
@@ -370,6 +395,38 @@ def determinar_castling_rights(board_array):
             castling += 'q'
     
     return castling if castling else '-'
+
+
+def mostrar_tablero_visual(board_array):
+    """
+    Muestra el tablero de forma visual en el terminal.
+    """
+    print("\n" + "="*50)
+    print("TABLERO DETECTADO:")
+    print("="*50)
+    
+    # Símbolos Unicode para las piezas
+    simbolos = {
+        'K': '♔', 'Q': '♕', 'R': '♖', 'B': '♗', 'N': '♘', 'P': '♙',
+        'k': '♚', 'q': '♛', 'r': '♜', 'b': '♝', 'n': '♞', 'p': '♟',
+        None: '·'
+    }
+    
+    print("  +---+---+---+---+---+---+---+---+")
+    for fila_idx in range(8):
+        fila_num = 8 - fila_idx
+        fila = board_array[fila_idx]
+        
+        # Imprimir fila con piezas
+        print(f"{fila_num} |", end="")
+        for pieza in fila:
+            simbolo = simbolos.get(pieza, '·')
+            print(f" {simbolo} |", end="")
+        print()
+        print("  +---+---+---+---+---+---+---+---+")
+    
+    print("    a   b   c   d   e   f   g   h")
+    print()
 
 
 # --------------------------------------------------
@@ -416,14 +473,19 @@ def imagen_a_fen(ruta):
         filas.append(fen_fila)
         board_array.append(fila_piezas)
 
-    # Invertir para FEN
-    filas_reversed = filas[::-1]
+    # Las filas están en orden de imagen (top to bottom = fila 8 a fila 1)
+    # FEN requiere fila 8 primero, así que NO invertir
+    
+    # Mostrar tablero visual
+    mostrar_tablero_visual(board_array)
     
     # Determinar derechos de enroque
     castling_rights = determinar_castling_rights(board_array)
 
-    # Construir FEN
-    fen = "/".join(filas_reversed) + f" w {castling_rights} - 0 1"
+    # Construir FEN - las filas ya están en orden correcto
+    fen = "/".join(filas) + f" w {castling_rights} - 0 1"
+    
+    logger.info(f"Primeras 3 filas FEN: {filas[0]} / {filas[1]} / {filas[2]}")
     
     logger.info(f"FEN generado: {fen}")
     
@@ -497,11 +559,11 @@ if __name__ == "__main__":
         fen = imagen_a_fen(imagen_path)
         move, score = analizar(fen)
 
-        print(f"\n{'='*60}")
-        print(f"✓ FEN: {fen}")
-        print(f"✓ Mejor movimiento: {move}")
-        print(f"✓ Score: {score:+.2f}")
-        print(f"{'='*60}")
+        print("="*60)
+        print(f"FEN: {fen}")
+        print(f"Mejor movimiento: {move}")
+        print(f"Evaluación: {score:+.2f}")
+        print("="*60)
         
     except Exception as e:
         logger.exception("Error en el análisis:")
