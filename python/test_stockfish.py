@@ -8,7 +8,7 @@ from pathlib import Path
 # --------------------------------------------------
 # LOGGING
 # --------------------------------------------------
-logging.basicConfig(level=logging.INFO)  # INFO para output limpio
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------
@@ -19,8 +19,7 @@ CARPETA_TEMPLATES = BASE_DIR / "templates"
 RUTA_STOCKFISH = BASE_DIR.parent / "stockfish" / "stockfish-ubuntu-x86-64"
 
 ESTILO_FIJO = "neo"
-UMBRAL_COINCIDENCIA = 0.45  # Bajado más para piezas blancas
-DEBUG_CASILLAS = True
+DEBUG_CASILLAS = True  # Cambiar a True para debug
 
 CARPETA_DEBUG = Path("/home/daw/Documents/proyecto/python/debugIMG")
 CARPETA_DEBUG.mkdir(parents=True, exist_ok=True)
@@ -78,12 +77,7 @@ def obtener_casillas_reales(img):
     mask = mascara_tablero(img, c1, c2)
     v_lines, h_lines = detectar_lineas_grid(mask)
 
-    logger.info(f"Líneas horizontales (y): {h_lines}")
-    logger.info(f"Primera fila será desde y={h_lines[0]} hasta y={h_lines[1]}")
-    logger.info(f"Última fila será desde y={h_lines[7]} hasta y={h_lines[8]}")
-
     casillas = []
-    # Leer en el orden que aparece en la imagen (top to bottom)
     for fila in range(8):
         fila_casillas = []
         for col in range(8):
@@ -94,7 +88,6 @@ def obtener_casillas_reales(img):
             fila_casillas.append(img[y1:y2, x1:x2])
         casillas.append(fila_casillas)
 
-    logger.debug("64 casillas reales detectadas")
     return casillas
 
 
@@ -103,8 +96,9 @@ def obtener_casillas_reales(img):
 # --------------------------------------------------
 def cargar_templates():
     """
-    Carga templates y los organiza por tipo de pieza (sin color).
-    Retorna diccionario con forma -> [templates]
+    Carga templates separados por color.
+    Retorna: (templates_white, templates_black)
+    donde cada uno es un dict: {'P': [img1, img2], 'N': [...], ...}
     """
     templates_white = {}
     templates_black = {}
@@ -113,31 +107,30 @@ def cargar_templates():
     if not pieces_dir.exists():
         raise FileNotFoundError(f"Directorio de templates no encontrado: {pieces_dir}")
 
-    mapping_white = {
-        "wp": "P", "wn": "N", "wb": "B", "wr": "R", "wq": "Q", "wk": "K"
-    }
-    
-    mapping_black = {
-        "bp": "p", "bn": "n", "bb": "b", "br": "r", "bq": "q", "bk": "k"
+    # Mapeo: prefijo archivo → letra FEN
+    mapping = {
+        'wp': 'P', 'wn': 'N', 'wb': 'B', 'wr': 'R', 'wq': 'Q', 'wk': 'K',
+        'bp': 'p', 'bn': 'n', 'bb': 'b', 'br': 'r', 'bq': 'q', 'bk': 'k'
     }
 
-    # Cargar templates blancos
     for archivo in pieces_dir.iterdir():
         if archivo.suffix.lower() != ".png":
             continue
+        
         stem = archivo.stem.lower()
+        img = cv2.imread(str(archivo), cv2.IMREAD_GRAYSCALE)
         
-        for code, fen in mapping_white.items():
-            if stem.startswith(code):
-                img = cv2.imread(str(archivo), cv2.IMREAD_GRAYSCALE)
-                if img is not None:
-                    templates_white.setdefault(fen, []).append(img)
+        if img is None:
+            continue
         
-        for code, fen in mapping_black.items():
-            if stem.startswith(code):
-                img = cv2.imread(str(archivo), cv2.IMREAD_GRAYSCALE)
-                if img is not None:
-                    templates_black.setdefault(fen, []).append(img)
+        # Determinar qué pieza es
+        for prefix, fen_char in mapping.items():
+            if stem.startswith(prefix):
+                if prefix.startswith('w'):
+                    templates_white.setdefault(fen_char, []).append(img)
+                else:
+                    templates_black.setdefault(fen_char, []).append(img)
+                break
 
     if not templates_white or not templates_black:
         raise ValueError("No se cargaron templates de piezas")
@@ -149,21 +142,136 @@ def cargar_templates():
 
 
 # --------------------------------------------------
-# DETECCIÓN DE COLOR DE PIEZA
+# NORMALIZACIÓN
 # --------------------------------------------------
-def detectar_color_pieza(casilla):
-    """
-    Detecta si una pieza es blanca o negra basándose en los píxeles.
-    Retorna: 'white', 'black', o None si no hay pieza
-    """
-    # Normalizar casilla (eliminar destacados amarillos)
-    casilla_norm = normalizar_casilla(casilla)
+def normalizar_casilla(casilla):
+    """Elimina highlights (amarillo/verde)."""
+    hsv = cv2.cvtColor(casilla, cv2.COLOR_BGR2HSV)
     
-    # Convertir a escala de grises
+    # Amarillo
+    lower_yellow = np.array([20, 100, 100])
+    upper_yellow = np.array([35, 255, 255])
+    mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow)
+    
+    # Verde
+    lower_green = np.array([40, 50, 100])
+    upper_green = np.array([80, 255, 255])
+    mask_green = cv2.inRange(hsv, lower_green, upper_green)
+    
+    mask_highlight = cv2.bitwise_or(mask_yellow, mask_green)
+    
+    if np.sum(mask_highlight) > (casilla.shape[0] * casilla.shape[1] * 0.25 * 255):
+        casilla_normalizada = casilla.copy()
+        casilla_normalizada[mask_highlight > 0] = [110, 145, 95]
+    else:
+        casilla_normalizada = casilla
+    
+    return casilla_normalizada
+
+
+# --------------------------------------------------
+# DETECCIÓN DE CASILLA VACÍA
+# --------------------------------------------------
+def es_casilla_vacia(casilla):
+    """
+    Detecta si una casilla está vacía.
+    Más estricto para evitar falsos positivos.
+    """
+    casilla_norm = normalizar_casilla(casilla)
     gray = cv2.cvtColor(casilla_norm, cv2.COLOR_BGR2GRAY)
     
-    # Obtener el color del fondo (esquinas de la casilla)
+    # Criterio 1: Variación baja
+    std = np.std(gray)
+    mean_val = np.mean(gray)
+    
+    # Criterio 2: Pocos píxeles diferentes del promedio
+    diff_pixels = np.sum(np.abs(gray - mean_val) > 35)  # Aumentado de 30
+    total_pixels = gray.shape[0] * gray.shape[1]
+    diff_ratio = diff_pixels / total_pixels
+    
+    # Criterio 3: Analizar el centro específicamente
     h, w = gray.shape
+    centro = gray[h//3:2*h//3, w//3:2*w//3]
+    std_centro = np.std(centro)
+    
+    # Vacía si: baja variación global Y baja variación en centro Y pocos píxeles diferentes
+    es_vacia = std < 20 and std_centro < 15 and diff_ratio < 0.12
+    
+    return es_vacia
+
+
+# --------------------------------------------------
+# TEMPLATE MATCHING SIMPLE
+# --------------------------------------------------
+def match_template(casilla_gray, template, usar_bordes=False):
+    """
+    Hace template matching entre una casilla y un template.
+    Retorna el mejor score encontrado.
+    """
+    ch, cw = casilla_gray.shape[:2]
+    th, tw = template.shape[:2]
+    
+    mejor_score = -1
+    
+    # Preprocesar casilla
+    casilla_proc = cv2.GaussianBlur(casilla_gray, (3, 3), 0)
+    
+    if usar_bordes:
+        # Para piezas blancas: usar bordes
+        edges = cv2.Canny(casilla_proc, 50, 150)
+        casilla_proc = cv2.addWeighted(casilla_proc, 0.7, edges, 0.3, 0)
+    
+    casilla_proc = cv2.normalize(casilla_proc, None, 0, 255, cv2.NORM_MINMAX)
+    
+    # Preprocesar template igual
+    template_proc = cv2.GaussianBlur(template, (3, 3), 0)
+    
+    if usar_bordes:
+        edges_tpl = cv2.Canny(template_proc, 50, 150)
+        template_proc = cv2.addWeighted(template_proc, 0.7, edges_tpl, 0.3, 0)
+    
+    template_proc = cv2.normalize(template_proc, None, 0, 255, cv2.NORM_MINMAX)
+    
+    # Probar múltiples escalas
+    escalas = [0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3]
+    
+    for scale_factor in escalas:
+        scale = min(ch / th, cw / tw) * scale_factor
+        new_w, new_h = int(tw * scale), int(th * scale)
+        
+        if new_w < 10 or new_h < 10 or new_w > cw or new_h > ch:
+            continue
+            
+        tpl_resized = cv2.resize(template_proc, (new_w, new_h))
+        
+        # Probar dos métodos
+        for method in [cv2.TM_CCOEFF_NORMED, cv2.TM_CCORR_NORMED]:
+            try:
+                res = cv2.matchTemplate(casilla_proc, tpl_resized, method)
+                _, score, _, _ = cv2.minMaxLoc(res)
+                mejor_score = max(mejor_score, score)
+            except:
+                continue
+    
+    return mejor_score
+
+
+def identificar_pieza(casilla, templates_white, templates_black):
+    """
+    Identifica la pieza con un enfoque híbrido:
+    1. Análisis rápido para determinar si es blanca/negra/vacía
+    2. Template matching solo contra candidatos relevantes
+    """
+    if es_casilla_vacia(casilla):
+        return None
+    
+    casilla_norm = normalizar_casilla(casilla)
+    gray = cv2.cvtColor(casilla_norm, cv2.COLOR_BGR2GRAY)
+    
+    # PASO 1: Análisis rápido para determinar color probable
+    h, w = gray.shape
+    
+    # Detectar fondo (esquinas)
     esquinas = np.concatenate([
         gray[0:h//4, 0:w//4].flatten(),
         gray[0:h//4, 3*w//4:w].flatten(),
@@ -172,205 +280,122 @@ def detectar_color_pieza(casilla):
     ])
     fondo_mean = np.median(esquinas)
     
-    # Encontrar píxeles de la pieza (muy diferentes del fondo)
-    diff_from_bg = np.abs(gray.astype(float) - fondo_mean)
-    pieza_mask = diff_from_bg > 30  # Píxeles que son parte de la pieza
-    
-    # Si hay muy pocos píxeles de pieza, es casilla vacía
-    if np.sum(pieza_mask) < gray.size * 0.08:
-        return None
-    
-    # Extraer solo los píxeles de la pieza
-    pieza_pixels = gray[pieza_mask]
-    
-    # Calcular brillo promedio de la pieza
-    pieza_mean = np.mean(pieza_pixels)
-    
-    # Análisis del área central (más confiable)
+    # Píxeles de la pieza (centro)
     centro = gray[h//3:2*h//3, w//3:2*w//3]
-    centro_mask = diff_from_bg[h//3:2*h//3, w//3:2*w//3] > 30
+    diff_from_bg = np.abs(centro.astype(float) - fondo_mean)
+    pieza_mask = diff_from_bg > 30
     
-    if np.sum(centro_mask) > 0:
-        centro_pixels = centro[centro_mask]
-        centro_mean = np.mean(centro_pixels)
-    else:
-        centro_mean = pieza_mean
+    if np.sum(pieza_mask) < centro.size * 0.1:
+        return None  # Muy poca diferencia = vacía
+    
+    pieza_pixels = centro[pieza_mask]
+    pieza_mean = np.mean(pieza_pixels)
+    pieza_median = np.median(pieza_pixels)
+    
+    # Análisis adicional: percentil 75
+    p75 = np.percentile(pieza_pixels, 75)
     
     # Decisión basada en múltiples factores
-    # Las piezas blancas tienen relleno muy claro (>180)
-    # Las piezas negras/grises tienen relleno más oscuro (<140)
+    # Piezas blancas: mean > 140 OR (mean > 110 AND p75 > 150)
+    # Esto captura tanto piezas muy blancas como blancas en casillas oscuras
+    es_probable_blanca = (pieza_mean > 140) or (pieza_mean > 110 and p75 > 150)
     
-    if centro_mean > 165:  # Blanco claro
-        return 'white'
-    elif centro_mean < 120:  # Gris oscuro/negro
-        return 'black'
+    logger.debug(f"  Análisis: mean={pieza_mean:.1f}, median={pieza_median:.1f}, p75={p75:.1f}")
+    
+    # PASO 2: Template matching solo contra el color probable
+    scores = {}
+    
+    if es_probable_blanca:
+        # Probar solo templates blancos
+        for pieza, templates in templates_white.items():
+            max_score = 0
+            for template in templates:
+                score = match_template(gray, template, usar_bordes=True)
+                max_score = max(max_score, score)
+            scores[pieza] = max_score
     else:
-        # Zona ambigua - usar píxeles totales
-        if pieza_mean > 140:
-            return 'white'
-        else:
-            return 'black'
-
-
-def normalizar_casilla(casilla):
-    """
-    Normaliza una casilla para mejorar detección:
-    - Elimina casillas destacadas (amarillas)
-    """
-    hsv = cv2.cvtColor(casilla, cv2.COLOR_BGR2HSV)
+        # Probar solo templates negros
+        for pieza, templates in templates_black.items():
+            max_score = 0
+            for template in templates:
+                score = match_template(gray, template, usar_bordes=False)
+                max_score = max(max_score, score)
+            scores[pieza] = max_score
     
-    # Rango para amarillo (casillas destacadas)
-    lower_yellow = np.array([20, 100, 100])
-    upper_yellow = np.array([30, 255, 255])
+    # Encontrar el mejor
+    if not scores:
+        return None
     
-    mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow)
+    mejor_pieza = max(scores, key=scores.get)
+    mejor_score = scores[mejor_pieza]
     
-    # Si hay mucho amarillo, reemplazar
-    if np.sum(mask_yellow) > (casilla.shape[0] * casilla.shape[1] * 0.3 * 255):
-        casilla_normalizada = casilla.copy()
-        # Reemplazar con verde tablero
-        casilla_normalizada[mask_yellow > 0] = [120, 150, 100]
-    else:
-        casilla_normalizada = casilla
+    # Umbral mínimo
+    if mejor_score < 0.35:
+        return None
     
-    return casilla_normalizada
+    logger.debug(f"Probable: {'blanca' if es_probable_blanca else 'negra'}, Mejor: {mejor_pieza} ({mejor_score:.3f})")
+    
+    return mejor_pieza
 
 
 # --------------------------------------------------
-# DETECCIÓN PIEZAS
+# CORRECCIÓN DE ERRORES
 # --------------------------------------------------
-def es_casilla_vacia(casilla):
-    """Detecta si una casilla está vacía."""
-    casilla_norm = normalizar_casilla(casilla)
-    gray = cv2.cvtColor(casilla_norm, cv2.COLOR_BGR2GRAY)
-    
-    std = np.std(gray)
-    mean_val = np.mean(gray)
-    
-    # Buscar píxeles muy diferentes del promedio
-    diff_pixels = np.sum(np.abs(gray - mean_val) > 30)
-    total_pixels = gray.shape[0] * gray.shape[1]
-    diff_ratio = diff_pixels / total_pixels
-    
-    # Vacía si: baja variación Y pocos píxeles diferentes
-    return std < 18 and diff_ratio < 0.15
-
-
-def identificar_tipo_pieza(casilla, templates, es_blanca=True):
+def corregir_errores_basicos(board_array, casillas, templates_white, templates_black):
     """
-    Identifica el TIPO de pieza usando template matching.
-    Usa diferentes estrategias para piezas blancas vs negras.
+    Corrige errores obvios como múltiples reyes.
     """
-    casilla_norm = normalizar_casilla(casilla)
-    gray = cv2.cvtColor(casilla_norm, cv2.COLOR_BGR2GRAY)
+    board_corregido = [fila[:] for fila in board_array]
     
-    # Preprocesamiento básico
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    # Contar reyes
+    white_kings = [(r, c) for r in range(8) for c in range(8) if board_corregido[r][c] == 'K']
+    black_kings = [(r, c) for r in range(8) for c in range(8) if board_corregido[r][c] == 'k']
     
-    ch, cw = gray.shape[:2]
-    mejor_score = -1
-    mejor_tipo = None
-    
-    # Para piezas BLANCAS: usar detección de bordes (tienen contorno negro)
-    if es_blanca:
-        edges = cv2.Canny(gray, 50, 150)
-        gray_proc = cv2.addWeighted(gray, 0.7, edges, 0.3, 0)
-        gray_proc = cv2.normalize(gray_proc, None, 0, 255, cv2.NORM_MINMAX)
-    else:
-        # Para piezas NEGRAS: usar solo escala de grises normalizada
-        # (no tienen bordes fuertes, son grises sólidos)
-        gray_proc = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-        # Opcional: invertir para mejor match
-        # gray_proc = 255 - gray_proc
-
-    for pieza_letra, imgs in templates.items():
-        tipo = pieza_letra.upper()
-        max_score_tipo = 0
+    # Si hay múltiples reyes blancos
+    if len(white_kings) > 1:
+        logger.warning(f"Múltiples reyes blancos: {white_kings}")
+        # Recalcular scores específicos
+        candidatos = []
+        for r, c in white_kings:
+            casilla = casillas[r][c]
+            gray = cv2.cvtColor(normalizar_casilla(casilla), cv2.COLOR_BGR2GRAY)
+            
+            score_rey = max(match_template(gray, t, True) for t in templates_white.get('K', []))
+            score_peon = max(match_template(gray, t, True) for t in templates_white.get('P', []))
+            
+            candidatos.append((r, c, score_rey - score_peon))
         
-        for tpl in imgs:
-            # Preprocesar template igual que la casilla
-            tpl_proc = cv2.GaussianBlur(tpl, (3, 3), 0)
-            
-            if es_blanca:
-                edges_tpl = cv2.Canny(tpl_proc, 50, 150)
-                tpl_proc = cv2.addWeighted(tpl_proc, 0.7, edges_tpl, 0.3, 0)
-                tpl_proc = cv2.normalize(tpl_proc, None, 0, 255, cv2.NORM_MINMAX)
-            else:
-                tpl_proc = cv2.normalize(tpl_proc, None, 0, 255, cv2.NORM_MINMAX)
-            
-            th, tw = tpl_proc.shape[:2]
-            
-            # Probar varias escalas
-            escalas = [0.6, 0.75, 0.85, 0.95, 1.0, 1.1, 1.25, 1.4] if not es_blanca else [0.6, 0.75, 0.9, 1.0, 1.1, 1.25]
-            
-            for scale_factor in escalas:
-                scale = min(ch / th, cw / tw) * scale_factor
-                new_w, new_h = int(tw * scale), int(th * scale)
-                
-                if new_w < 10 or new_h < 10 or new_w > cw or new_h > ch:
-                    continue
-                    
-                tpl_r = cv2.resize(tpl_proc, (new_w, new_h))
-
-                # Probar diferentes métodos de matching
-                for method in [cv2.TM_CCOEFF_NORMED, cv2.TM_CCORR_NORMED]:
-                    res = cv2.matchTemplate(gray_proc, tpl_r, method)
-                    _, score, _, _ = cv2.minMaxLoc(res)
-                    
-                    max_score_tipo = max(max_score_tipo, score)
-
-                    if score > mejor_score:
-                        mejor_score = score
-                        mejor_tipo = tipo
+        # Mantener solo el mejor
+        candidatos.sort(key=lambda x: x[2], reverse=True)
+        rey_real = (candidatos[0][0], candidatos[0][1])
         
-        # Log para debugging
-        if max_score_tipo > 0.3:
-            logger.debug(f"  {tipo}: {max_score_tipo:.3f}")
-
-    logger.debug(f"Mejor match: {mejor_tipo} con score {mejor_score:.3f}")
+        for r, c in white_kings:
+            if (r, c) != rey_real:
+                board_corregido[r][c] = 'P'
+                logger.info(f"Cambiando [{r},{c}] K → P")
     
-    # Umbral más bajo para piezas negras
-    umbral = UMBRAL_COINCIDENCIA if es_blanca else UMBRAL_COINCIDENCIA * 0.85
+    # Mismo proceso para reyes negros
+    if len(black_kings) > 1:
+        logger.warning(f"Múltiples reyes negros: {black_kings}")
+        candidatos = []
+        for r, c in black_kings:
+            casilla = casillas[r][c]
+            gray = cv2.cvtColor(normalizar_casilla(casilla), cv2.COLOR_BGR2GRAY)
+            
+            score_rey = max(match_template(gray, t, False) for t in templates_black.get('k', []))
+            score_peon = max(match_template(gray, t, False) for t in templates_black.get('p', []))
+            
+            candidatos.append((r, c, score_rey - score_peon))
+        
+        candidatos.sort(key=lambda x: x[2], reverse=True)
+        rey_real = (candidatos[0][0], candidatos[0][1])
+        
+        for r, c in black_kings:
+            if (r, c) != rey_real:
+                board_corregido[r][c] = 'p'
+                logger.info(f"Cambiando [{r},{c}] k → p")
     
-    if mejor_score >= umbral:
-        return mejor_tipo
-
-    return None
-
-
-def identificar_pieza(casilla, templates_white, templates_black):
-    """
-    Identifica la pieza completa (tipo + color).
-    """
-    if es_casilla_vacia(casilla):
-        return None
-    
-    # 1. Detectar color
-    color = detectar_color_pieza(casilla)
-    
-    if color is None:
-        logger.debug(f"Color detectado: None (casilla vacía)")
-        return None
-    
-    logger.debug(f"Color detectado: {color}")
-    
-    # 2. Detectar tipo usando templates apropiados
-    if color == 'white':
-        tipo = identificar_tipo_pieza(casilla, templates_white, es_blanca=True)
-        if tipo:
-            logger.debug(f"Tipo detectado: {tipo} -> {tipo.upper()}")
-            return tipo.upper()  # P, N, B, R, Q, K
-        else:
-            logger.debug(f"No se detectó tipo para pieza blanca")
-    else:  # black
-        tipo = identificar_tipo_pieza(casilla, templates_black, es_blanca=False)
-        if tipo:
-            logger.debug(f"Tipo detectado: {tipo} -> {tipo.lower()}")
-            return tipo.lower()  # p, n, b, r, q, k
-        else:
-            logger.debug(f"No se detectó tipo para pieza negra")
-    
-    return None
+    return board_corregido
 
 
 # --------------------------------------------------
@@ -380,14 +405,12 @@ def determinar_castling_rights(board_array):
     """Determina los derechos de enroque."""
     castling = ""
     
-    # Enroque blanco (fila 7 = fila 1 del tablero)
     if board_array[7][4] == 'K':
         if board_array[7][7] == 'R':
             castling += 'K'
         if board_array[7][0] == 'R':
             castling += 'Q'
     
-    # Enroque negro (fila 0 = fila 8 del tablero)
     if board_array[0][4] == 'k':
         if board_array[0][7] == 'r':
             castling += 'k'
@@ -398,14 +421,11 @@ def determinar_castling_rights(board_array):
 
 
 def mostrar_tablero_visual(board_array):
-    """
-    Muestra el tablero de forma visual en el terminal.
-    """
+    """Muestra el tablero de forma visual."""
     print("\n" + "="*50)
     print("TABLERO DETECTADO:")
     print("="*50)
     
-    # Símbolos Unicode para las piezas
     simbolos = {
         'K': '♔', 'Q': '♕', 'R': '♖', 'B': '♗', 'N': '♘', 'P': '♙',
         'k': '♚', 'q': '♛', 'r': '♜', 'b': '♝', 'n': '♞', 'p': '♟',
@@ -417,7 +437,6 @@ def mostrar_tablero_visual(board_array):
         fila_num = 8 - fila_idx
         fila = board_array[fila_idx]
         
-        # Imprimir fila con piezas
         print(f"{fila_num} |", end="")
         for pieza in fila:
             simbolo = simbolos.get(pieza, '·')
@@ -440,14 +459,11 @@ def imagen_a_fen(ruta):
     casillas = obtener_casillas_reales(img)
     templates_white, templates_black = cargar_templates()
 
-    board_array = []
-    filas = []
+    # Primera pasada: detectar todas las piezas
+    detecciones_raw = []
 
     for fila in range(8):
-        fen_fila = ""
-        vacios = 0
-        fila_piezas = []
-
+        fila_detecciones = []
         for col in range(8):
             casilla = casillas[fila][col]
 
@@ -456,60 +472,53 @@ def imagen_a_fen(ruta):
                 cv2.imwrite(str(ruta_debug), casilla)
 
             pieza = identificar_pieza(casilla, templates_white, templates_black)
-
+            fila_detecciones.append(pieza)
+        
+        detecciones_raw.append(fila_detecciones)
+    
+    # Segunda pasada: corrección de errores
+    board_array = corregir_errores_basicos(detecciones_raw, casillas, templates_white, templates_black)
+    
+    # Construir FEN
+    filas = []
+    for fila_piezas in board_array:
+        fen_fila = ""
+        vacios = 0
+        
+        for pieza in fila_piezas:
             if pieza is None:
                 vacios += 1
-                fila_piezas.append(None)
             else:
                 if vacios:
                     fen_fila += str(vacios)
                     vacios = 0
                 fen_fila += pieza
-                fila_piezas.append(pieza)
 
         if vacios:
             fen_fila += str(vacios)
 
         filas.append(fen_fila)
-        board_array.append(fila_piezas)
 
-    # Las filas están en orden de imagen (top to bottom = fila 8 a fila 1)
-    # FEN requiere fila 8 primero, así que NO invertir
-    
-    # Mostrar tablero visual
     mostrar_tablero_visual(board_array)
-    
-    # Determinar derechos de enroque
     castling_rights = determinar_castling_rights(board_array)
-
-    # Construir FEN - las filas ya están en orden correcto
     fen = "/".join(filas) + f" w {castling_rights} - 0 1"
-    
-    logger.info(f"Primeras 3 filas FEN: {filas[0]} / {filas[1]} / {filas[2]}")
     
     logger.info(f"FEN generado: {fen}")
     
-    # Validar FEN
+    # Validar
     try:
         board = chess.Board(fen)
         
-        # Verificar reyes
         white_kings = sum(1 for row in board_array for piece in row if piece == 'K')
         black_kings = sum(1 for row in board_array for piece in row if piece == 'k')
         
         if white_kings != 1 or black_kings != 1:
             error_msg = f"Posición ilegal: {white_kings} rey(es) blanco(s), {black_kings} rey(es) negro(s)"
             logger.error(error_msg)
-            logger.warning(f"Umbral actual: {UMBRAL_COINCIDENCIA}")
-            
-            logger.info("Tablero detectado:")
-            for i, row in enumerate(board_array):
-                logger.info(f"Fila {8-i}: {['.' if p is None else p for p in row]}")
-            
             raise ValueError(error_msg)
             
     except ValueError as e:
-        logger.error(f"FEN inválido generado: {fen}")
+        logger.error(f"FEN inválido: {fen}")
         logger.error(f"Error: {e}")
         raise
     
@@ -530,7 +539,7 @@ def analizar(fen):
     engine = None
     try:
         engine = chess.engine.SimpleEngine.popen_uci(str(RUTA_STOCKFISH))
-        info = engine.analyse(board, chess.engine.Limit(depth=12))
+        info = engine.analyse(board, chess.engine.Limit(depth=15))
         
         move = info["pv"][0]
         score = info["score"].white().score(mate_score=10000)
@@ -538,7 +547,7 @@ def analizar(fen):
         return move, score / 100
     
     except chess.engine.EngineTerminatedError as e:
-        logger.error(f"Stockfish se cerró inesperadamente: {e}")
+        logger.error(f"Stockfish se cerró: {e}")
         raise
     
     finally:
